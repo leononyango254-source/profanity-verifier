@@ -1,1 +1,97 @@
-__WORKFLOW__
+name: profanity-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidates:
+        description: 'JSON array of candidates: [{"address":"0x..","pubkey":"0x.."}] (pubkey optional)'
+        required: true
+        type: string
+      shards:
+        description: 'Number of seed-space shards per candidate'
+        required: false
+        default: '64'
+      depth:
+        description: 'Chain depth to walk down from each candidate pubkey'
+        required: false
+        default: '16777216'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: prove the derivation before spending runner time
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: profanity-verifier
+      - name: Build and self-test
+        run: |
+          set -euo pipefail
+          cargo build --release
+          ./target/release/profanity-verifier --selftest
+          echo "derivation, address, chain, walk-down and seed scan all consistent"
+
+  plan:
+    name: plan the matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.emit.outputs.matrix }}
+    steps:
+      - id: emit
+        env:
+          CANDIDATES: ${{ inputs.candidates }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import json, os
+          cands = json.loads(os.environ["CANDIDATES"])
+          shards = int(os.environ["SHARDS"])
+          include = [{"candidate": json.dumps(c), "shard": i, "label": c["address"] + "#" + str(i)} for c in cands for i in range(shards)]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": include}) + "\n")
+          print(f"planned {len(include)} jobs for {len(cands)} candidates x {shards} shards")
+          '
+
+  verify:
+    name: ${{ matrix.label }}
+    needs: [selftest, plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: profanity-verifier
+      - name: Build
+        run: cargo build --release
+      - name: Search this shard
+        env:
+          CANDIDATE: ${{ matrix.candidate }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          DEPTH: ${{ inputs.depth }}
+        run: |
+          set -euo pipefail
+          ADDRESS=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["address"])')
+          PUBKEY=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c.get("pubkey",""))')
+          ARGS=(--address "$ADDRESS" --shard "$SHARD/$SHARDS" --depth "$DEPTH")
+          if [ -n "$PUBKEY" ]; then ARGS+=(--pubkey "$PUBKEY"); fi
+          ./target/release/profanity-verifier "${ARGS[@]}" | tee result.json
+          python3 -c '
+          import json
+          r = json.load(open("result.json"))
+          print("### " + r["address"] + " shard " + r["shard"])
+          print("- seeds checked: " + str(r["seeds_checked"]))
+          print("- match: " + str(r["match"]))
+          '
