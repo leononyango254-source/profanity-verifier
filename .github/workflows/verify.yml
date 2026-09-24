@@ -4,15 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       candidates:
-        description: 'JSON array of candidates: [{"address":"0x..","pubkey":"0x.."}] (pubkey optional)'
-        required: true
+        description: 'JSON array of single-candidate checks: [{"address":"0x..","pubkey":"0x.."}] (pubkey optional)'
+        required: false
+        default: '[]'
+        type: string
+      targets:
+        description: 'JSON array of addresses for the multi-target pass: one scan of the whole seed space, chain position 0, all addresses at once'
+        required: false
+        default: ''
         type: string
       shards:
-        description: 'Number of seed-space shards per candidate'
+        description: 'Number of seed-space shards'
         required: false
         default: '64'
       depth:
-        description: 'Chain depth to walk down from each candidate pubkey'
+        description: 'Chain depth to walk down from each candidate pubkey (single-candidate mode)'
         required: false
         default: '16777216'
 
@@ -46,17 +52,23 @@ jobs:
       - id: emit
         env:
           CANDIDATES: ${{ inputs.candidates }}
+          TARGETS: ${{ inputs.targets }}
           SHARDS: ${{ inputs.shards }}
         run: |
           set -euo pipefail
           python3 -c '
           import json, os
-          cands = json.loads(os.environ["CANDIDATES"])
           shards = int(os.environ["SHARDS"])
-          include = [{"candidate": json.dumps(c), "shard": i, "label": c["address"] + "#" + str(i)} for c in cands for i in range(shards)]
+          targets = os.environ.get("TARGETS", "").strip()
+          if targets:
+              include = [{"candidate": "", "shard": i, "label": "targets#" + str(i)} for i in range(shards)]
+              print(f"multi-target pass: {shards} shards over the whole seed space")
+          else:
+              cands = json.loads(os.environ.get("CANDIDATES") or "[]")
+              include = [{"candidate": json.dumps(c), "shard": i, "label": c["address"] + "#" + str(i)} for c in cands for i in range(shards)]
+              print(f"single-candidate pass: {len(include)} jobs for {len(cands)} candidates x {shards} shards")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": include}) + "\n")
-          print(f"planned {len(include)} jobs for {len(cands)} candidates x {shards} shards")
           '
 
   verify:
@@ -78,20 +90,19 @@ jobs:
       - name: Search this shard
         env:
           CANDIDATE: ${{ matrix.candidate }}
+          TARGETS: ${{ inputs.targets }}
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ inputs.shards }}
           DEPTH: ${{ inputs.depth }}
         run: |
           set -euo pipefail
-          ADDRESS=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["address"])')
-          PUBKEY=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c.get("pubkey",""))')
-          ARGS=(--address "$ADDRESS" --shard "$SHARD/$SHARDS" --depth "$DEPTH")
-          if [ -n "$PUBKEY" ]; then ARGS+=(--pubkey "$PUBKEY"); fi
-          ./target/release/profanity-verifier "${ARGS[@]}" | tee result.json
-          python3 -c '
-          import json
-          r = json.load(open("result.json"))
-          print("### " + r["address"] + " shard " + r["shard"])
-          print("- seeds checked: " + str(r["seeds_checked"]))
-          print("- match: " + str(r["match"]))
-          '
+          if [ -n "$TARGETS" ]; then
+            printf '%s' "$TARGETS" > targets.json
+            ./target/release/profanity-verifier --targets targets.json --shard "$SHARD/$SHARDS" | tee result.json
+          else
+            ADDRESS=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["address"])')
+            PUBKEY=$(printf '%s' "$CANDIDATE" | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c.get("pubkey",""))')
+            ARGS=(--address "$ADDRESS" --shard "$SHARD/$SHARDS" --depth "$DEPTH")
+            if [ -n "$PUBKEY" ]; then ARGS+=(--pubkey "$PUBKEY"); fi
+            ./target/release/profanity-verifier "${ARGS[@]}" | tee result.json
+          fi

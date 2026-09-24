@@ -122,6 +122,7 @@ fn main() {
     let mut shard_index: u64 = 0;
     let mut shard_count: u64 = 1;
     let mut depth: u64 = 1 << 24;
+    let mut targets: Option<String> = None;
     let mut selftest = false;
 
     let mut i = 1;
@@ -146,6 +147,10 @@ fn main() {
             }
             "--depth" => {
                 depth = args[i + 1].parse().unwrap_or(depth);
+                i += 2;
+            }
+            "--targets" => {
+                targets = Some(args[i + 1].clone());
                 i += 2;
             }
             "--selftest" => {
@@ -175,6 +180,68 @@ fn main() {
 
     if selftest {
         run_selftest();
+        return;
+    }
+
+    // Multi-target mode: check every seed's address against a whole set of
+    // addresses at once. This is the cheap, high-throughput pass: one 64-shard
+    // run tests thousands of candidates at chain position 0 simultaneously.
+    if let Some(path) = targets {
+        let list: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&path).expect("read targets"))
+            .expect("targets file must be a JSON array of addresses");
+        let set: HashSet<[u8; 20]> = list
+            .iter()
+            .filter_map(|a| {
+                let raw = hex::decode(a.trim_start_matches("0x")).ok()?;
+                if raw.len() != 20 {
+                    return None;
+                }
+                let mut b = [0u8; 20];
+                b.copy_from_slice(&raw);
+                Some(b)
+            })
+            .collect();
+        let total: u64 = 1u64 << 32;
+        let per_shard = total / shard_count;
+        let start = shard_index * per_shard;
+        let end = if shard_index == shard_count - 1 { total } else { start + per_shard };
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        eprintln!("  multi-target: {} addresses, seeds [{}, {}) on {} threads", set.len(), start, end, threads);
+        let secp = Secp256k1::new();
+        let counter = AtomicU64::new(start);
+        let checked = AtomicU64::new(0);
+        let hits = std::sync::Mutex::new(Vec::<String>::new());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let x = counter.fetch_add(1, Ordering::Relaxed);
+                    if x >= end {
+                        break;
+                    }
+                    let bytes = profanity_key_bytes(x as u32);
+                    let Ok(sk) = SecretKey::from_slice(&bytes) else { continue };
+                    let pk = PublicKey::from_secret_key(&secp, &sk);
+                    let addr = address_of(&pk);
+                    if set.contains(&addr) {
+                        hits.lock().unwrap().push(format!("0x{}", hex::encode(addr)));
+                        eprintln!("  MATCH: seed in this shard produces target 0x{}", hex::encode(addr));
+                    }
+                    let n = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % (1 << 24) == 0 {
+                        let secs = started.elapsed().as_secs_f64();
+                        eprintln!("  progress: {} seeds ({:.0}/s)", n, n as f64 / secs.max(0.001));
+                    }
+                });
+            }
+        });
+        let hits = hits.into_inner().unwrap();
+        println!(
+            "{{\"targets\":{},\"shard\":\"{}/{}\",\"seeds_checked\":{},\"seconds\":{:.1},\"matches\":{}}}",
+            set.len(), shard_index, shard_count,
+            checked.load(Ordering::Relaxed), started.elapsed().as_secs_f64(),
+            serde_json::to_string(&hits).unwrap()
+        );
         return;
     }
 
